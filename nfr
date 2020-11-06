@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+
+import urllib.request
+import json
+import csv
+import os
+import pprint
+from collections import defaultdict
+import numpy
+import argparse
+import re
+import sys
+import humanfriendly
+
+from argparse import RawTextHelpFormatter
+
+parser = argparse.ArgumentParser(description='Mr. Netops nifty fastly reporter', epilog='Ya\'ll come back now ya hear!', formatter_class=RawTextHelpFormatter)
+parser.add_argument('-service', help='regex selection by service id.\n\texample: 4IeVxrD5o26p1FsDRMh9Ww', default='.')
+parser.add_argument('-field', help='regex selection by data field.\n\texample: body_size', default='.')
+parser.add_argument('-name', help='regex selection by service name.\n\texample: spiffyServiceName', default='.')
+parser.add_argument('-domain', help='regex selection by domain name\n\texample: www.fastly.com', default='.')
+parser.add_argument('-from', help='reporting from date', default='45+days')
+parser.add_argument('-to', help='reporting to date', default='now')
+parser.add_argument('-api_token', help='fastly api token(s)', default=os.environ['FASTLY_API_TOKEN'])
+parser.add_argument('-summary_name', help='name used for id, name & domain summary', default='SUMMARY')
+parser.add_argument('-key', help='primary keys for rows', choices=['service_id', 'service_name', 'domain'], default='service_id')
+parser.add_argument('-human', help='human readable values', action='store_true')
+
+args = parser.parse_args()
+
+FASTLY_API_TOKEN = os.environ['FASTLY_API_TOKEN']
+
+PERCENT = {
+    'attack_blocked_req_body_bytes': 'bandwidth',
+    'attack_blocked_req_header_bytes': 'bandwidth',
+    'attack_logged_req_body_bytes': 'bandwidth',
+    'attack_logged_req_header_bytes': 'bandwidth',
+    'attack_passed_req_body_bytes': 'bandwidth',
+    'attack_passed_req_header_bytes': 'bandwidth',
+    'attack_req_body_bytes': 'bandwidth',
+    'attack_req_header_bytes': 'bandwidth',
+    'attack_resp_synth_bytes': 'bandwidth',
+    'bandwidth': '',
+    'bereq_body_bytes': 'bandwidth',
+    'bereq_header_bytes': 'bandwidth',
+    'blacklist': 'requests',
+    'body_size': 'bandwidth',
+    'errors': 'requests',
+    'header_size': 'bandwidth',
+    'hit_ratio': '',
+    'hits': 'requests',
+    'hits_time': '',
+    'http2': 'requests',
+    'imgopto': 'requests',
+    'imgopto_resp_body_bytes': 'bandwidth',
+    'imgopto_resp_header_bytes': 'bandwidth',
+    'imgopto_shield_resp_body_bytes': 'bandwidth',
+    'imgopto_shield_resp_header_bytes': 'bandwidth',
+    'ipv6': 'requests',
+    'log': '',
+    'miss': 'requests',
+    'miss_time': '',
+    'object_size_100k': 'requests',
+    'object_size_100m': 'requests',
+    'object_size_10k': 'requests',
+    'object_size_10m': 'requests',
+    'object_size_1g': 'requests',
+    'object_size_1k': 'requests',
+    'object_size_1m': 'requests',
+    'orig_req_body_size': 'bandwidth',
+    'orig_req_header_size': 'bandwidth',
+    'orig_resp_body_size': 'bandwidth',
+    'orig_resp_header_size': 'bandwidth',
+    'otfp': 'requests',
+    'otfp_deliver_time': '',
+    'otfp_manifests': 'requests',
+    'otfp_resp_body_bytes': 'bandwidth',
+    'otfp_resp_header_bytes': 'bandwidth',
+    'otfp_shield_resp_body_bytes': 'bandwidth',
+    'otfp_shield_resp_header_bytes': 'bandwidth',
+    'otfp_shield_time': '',
+    'pass': 'requests',
+    'pass_time': '',
+    'pci': 'requests',
+    'pipe': 'requests',
+    'req_body_bytes': 'bandwidth',
+    'req_header_bytes': 'bandwidth',
+    'requests': '',
+    'resp_body_bytes': 'bandwidth',
+    'resp_header_bytes': 'bandwidth',
+    'restarts': '',
+    'shield': 'requests',
+    'shield_resp_body_bytes': 'bandwidth',
+    'shield_resp_header_bytes': 'bandwidth',
+    'start_time': '',
+    'status_1xx': 'requests',
+    'status_200': 'requests',
+    'status_204': 'requests',
+    'status_2xx': 'requests',
+    'status_301': 'requests',
+    'status_302': 'requests',
+    'status_304': 'requests',
+    'status_3xx': 'requests',
+    'status_400': 'requests',
+    'status_401': 'requests',
+    'status_403': 'requests',
+    'status_404': 'requests',
+    'status_416': 'requests',
+    'status_4xx': 'requests',
+    'status_500': 'requests',
+    'status_501': 'requests',
+    'status_502': 'requests',
+    'status_503': 'requests',
+    'status_504': 'requests',
+    'status_505': 'requests',
+    'status_5xx': 'requests',
+    'synth': 'requests',
+    'tls': 'requests',
+    'tls_v10': 'tls',
+    'tls_v11': 'tls',
+    'tls_v12': 'tls',
+    'tls_v13': 'tls',
+    'uncacheable': 'requests',
+    'video': 'requests',
+    'waf_blocked': 'requests',
+    'waf_logged': 'requests',
+    'waf_passed': 'requests',
+    'waf_bytes': 'bandwidth'
+}
+
+def apiGet(path, token):
+
+    url = 'https://api.fastly.com' + path
+    headers = { 'Fastly-Key': token }
+
+    #response = requests.get(url, headers=headers)
+    #data = response.json()
+    sys.stderr.write('apiGet: ' + path + '\n')
+    request = urllib.request.Request(url, headers=headers)
+    response = urllib.request.urlopen(request)
+    data = json.loads(response.read().decode('utf-8'))
+
+    '''
+    Handle encapsulated multipart paginated responses from fastly
+    i.e. /wafs/rules
+    '''
+
+    if all(key in data for key in ('data', 'links')):
+        links = data['links']
+        data = data['data']
+
+        # Follow all 'next' links
+        while 'next' in links:
+
+            sys.stderr.write('apiGet: ' + links['next'] + '\n')
+            request = urllib.request.Request(links['next'], headers=headers)
+            response = urllib.request.urlopen(request)
+
+            j = json.loads(response.read().decode('utf-8'))
+            links = j['links']
+            data += j['data']
+            pprint.pprint(links)
+
+    return data
+
+def derivedStats_wafBandwidth(entry):
+    
+    if not entry['requests'] > 0:
+        return 0
+
+    #
+    # half the bandwidth if shielded
+    # 
+
+    shieldMultipler = 1
+
+    if entry['shield_resp_header_bytes'] > 0 or entry['shield_resp_body_bytes'] > 0:
+        shieldMultipler = 0.5
+
+    return (entry['bereq_header_bytes'] + entry['bereq_body_bytes']) * shieldMultipler
+
+def derivedStats(entry):
+
+    entry['waf_bytes'] = derivedStats_wafBandwidth(entry)
+
+    derived = dict(entry)
+
+    for k, v in entry.items():
+        if k in PERCENT and PERCENT[k] in entry:
+            if entry[ PERCENT[k] ] > 0:
+                derived[k + '_pct'] = 100 * (v / entry[ PERCENT[k] ])
+            else:
+                derived[k + '_pct'] = 0
+
+    return derived
+
+def mergeStats(statsData):
+
+    mergedStats = {}
+    flattenedStats = {}
+
+    sys.stderr.write(
+        'mergeStats: From: {} To: {} By: {}\n'.format(
+            statsData['meta']['from'],
+            statsData['meta']['to'],
+            statsData['meta']['by']
+        )
+   )
+
+    mergedStats[args.summary_name] = defaultdict(list)
+    for service in statsData['data']:
+        mergedStats[service] = defaultdict(list)
+        for entry in statsData['data'][service]:
+            entry = derivedStats(entry)
+            for k, v in entry.items():
+		
+		#
+		# ignore string values like service_id
+		#
+
+                if type(v) is str:
+                    continue
+
+                mergedStats[service][k].append(v)
+                mergedStats[args.summary_name][k].append(v)
+
+    for service in mergedStats:
+        flattenedStats[service] = {}
+        for key in mergedStats[service]:
+
+            #
+            # ignore string values like service_id
+            #
+
+            if type(v) is str:
+                continue
+
+            if key == 'hit_ratio':
+                flattenedStats[service][key] = numpy.mean(mergedStats[service][key])
+            else:
+                flattenedStats[service][key] = numpy.sum(mergedStats[service][key])
+        flattenedStats[service] = derivedStats(flattenedStats[service])
+
+    return flattenedStats
+
+def mapServiceNames(services):
+
+    serviceName = {}
+    serviceName[args.summary_name] = args.summary_name
+    for service in services:
+        serviceName[ service['id'] ] = service['name']
+
+    return serviceName
+
+def mapServiceDomains(services):
+
+    serviceDomain = {}
+    domains = apiGet("/domains?filter[active]=true&page[size]=10000", args.api_token)
+
+    for entry in domains:
+
+        service_id = entry['relationships']['service']['data']['id']
+        domain_name = entry['attributes']['name']
+
+        if service_id not in serviceDomain:
+            serviceDomain[service_id] = set()
+
+        serviceDomain[service_id].add(domain_name)
+
+    return serviceDomain
+
+def selectServiceByID(services, regexp):
+
+    return [x for x in services if re.search(regexp, x)]
+
+def selectServiceByName(services, regexp, serviceMap):
+    
+    return [x for x in services if x in serviceMap and re.search(regexp, serviceMap[x], re.IGNORECASE)]
+
+def selectServiceByDomain(services, regexp, serviceMap):
+		
+    domainRegexp = re.compile(regexp, re.IGNORECASE)
+    return [x for x in services if x in serviceMap and list(filter(domainRegexp.search, serviceMap[x]))]
+
+def outputText(matchedServices, mergedStats):
+
+    for service in matchedServices:
+        matchedFields = sorted([x for x in mergedStats[service] if re.search(args.field, x)])
+        for k in matchedFields:
+            print(
+                service, 
+                k, 
+                format(mergedStats[service][k], '.2f'), 
+                serviceMap['name'][service], 
+                " ".join(serviceMap['domain'][service])
+            )
+
+def formatValue_default(key, value):
+
+    return format(value, '.2f')
+
+def formatValue_humanReadable(key, value):
+
+    if re.search('_pct$', key):
+        return format(value, '.2f') + '%'
+    if re.search('_bytes|bandwidth', key):
+        return humanfriendly.format_size(value, binary=False)
+
+    return humanfriendly.format_number(value, num_decimals=2)
+
+def formatValue(key, value):
+
+    if args.human:
+        return formatValue_humanReadable(key, value)
+    else:
+        return formatValue_default(key, value)
+
+def output_text(matchedServices, mergedStats):
+
+    for service in matchedServices:
+
+        matchedFields = sorted([x for x in mergedStats[service] if re.search(args.field, x)])
+        for k in matchedFields:
+             print(service, k, formatValue(k, mergedStats[service][k]), serviceMap['name'][service], " ".join(serviceMap['domain'][service]))
+
+services = apiGet("/service", args.api_token)
+
+serviceMap = {}
+serviceMap['name'] = mapServiceNames(services)
+serviceMap['domain'] = mapServiceDomains(services)
+
+mergedStats = mergeStats( 
+    # getattr(args, 'from') rather then args.from as from is a reserved word
+    apiGet("/stats?from=" + getattr(args, 'from') + "&to=" + args.to, args.api_token) 
+)
+
+matchedServices = mergedStats.keys()
+if args.service:
+    matchedServices = selectServiceByID(matchedServices, args.service)
+if args.name:
+    matchedServices = selectServiceByName(matchedServices, args.name, serviceMap['name'])
+if args.domain:
+    matchedServices = selectServiceByDomain(matchedServices, args.domain, serviceMap['domain'])
+
+output_text(matchedServices, mergedStats)
+
+with open('fastly.csv', 'w') as csvfile:
+    output = csv.writer(csvfile)
+    for service in matchedServices:
+        output.writerow(
+            [
+                " ".join(serviceMap['domain'][service]), 
+                format(mergedStats[service]['tls_v10_pct'], '.2f') + '%',
+                format(mergedStats[service]['tls_v11_pct'], '.2f') + '%',
+                format(mergedStats[service]['tls_v12_pct'], '.2f') + '%',
+                mergedStats[service]['tls']
+            ]
+        )
